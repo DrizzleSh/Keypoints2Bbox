@@ -85,17 +85,30 @@ class PtnDataset(Dataset):
             json_data = json.load(f)
         labels = []
         label = []
-        cur_label = '0'
+        is_firsttime = True
+        # cur_label = '0'
         for i, shape in enumerate(json_data['shapes']):
+            if is_firsttime:    # 第一次进来定义一下cur_label
+                is_firsttime = False
+                cur_label = shape['label']
             # if shape['shape_type'] == 'point':
             if shape['shape_type'] == 'rectangle':
+                # box = shape['points'][0] + shape['points'][1]
+                # labels.append(box)
                 continue
             if shape['label'] != cur_label:
+                label = self.kpt2box(label, cur_label)
                 labels.append(label)    # 每换一个人，添加一组数据上去
                 label = []
                 cur_label = shape['label']
+
+            group_id = int(shape['group_id'])
+            # if 0 < group_id < 5:
+            #     continue
+
             label += shape['points']
 
+        label = self.kpt2box(label, cur_label)
         labels.append(label)    # 加上最后一组
 
 
@@ -108,6 +121,14 @@ class PtnDataset(Dataset):
     def __len__(self):
         return len(self.image_list)
 
+    def kpt2box(self, label, cur_label):
+        label = np.array(label)
+        label = np.transpose(label)
+        xmin, xmax = np.min(label[0]) - 20, np.max(label[0]) + 20
+        ymin, ymax = np.min(label[1]) - 20, np.max(label[1]) + 20
+        label = label.transpose().tolist()
+        label.append([xmin, ymin, xmax, ymax, cur_label])
+        return label
 
 def collate_fn(data):
     img, labs = data[0]
@@ -115,7 +136,7 @@ def collate_fn(data):
     #     labs[i] = np.array(lab)
     for i, person in enumerate(labs):
         # for j, point in enumerate(person):
-        labs[i] = np.array(person)
+        labs[i] = [np.array(person[:-1]), np.array(person[-1])]
     return img, labs
 
 
@@ -125,14 +146,14 @@ if __name__ == '__main__':
     parser.add_argument('--device', type=str, default='cuda', help='GPU or CPU')
     parser.add_argument('--model_type', type=str, default='default', help='model_type')
     parser.add_argument('--images_dir', type=str, default='', help='Dir of images')
-    parser.add_argument('--result_dir', type=str, default='', help='Dir to save results')
+    # parser.add_argument('--result_dir', type=str, default='', help='Dir to save results')
     args = parser.parse_args()
 
     sam_checkpoint = args.sam_ckpt
     device = args.device
     model_type = args.model_type
     images_dir = args.images_dir
-    result_dir = args.result_dir
+    # result_dir = args.result_dir
 
     print('loading model......')
     sam = sam_model_registry[model_type](checkpoint=sam_checkpoint)
@@ -149,12 +170,19 @@ if __name__ == '__main__':
     pbar = tqdm(enumerate(dataloader, start=1), total=len(dataloader))
     for i, (image, label) in pbar:  # uint8
         pbar.set_description(f'正在处理第{i}幅图片')
+
+        filename = str(i).zfill(6) + '.json'
+        file_path = os.path.join(images_dir, filename)
+        with open(file_path, 'r') as f:
+            datas = json.load(f)
+
         mask_generate.set_image(image)
-        newlabels = []
-        for points in label:   # 每次更新一个框
-            point_labels = np.ones(len(points))
-            mask, _, _ = mask_generate.predict(point_coords=points,
-                                               point_labels=point_labels,
+        # newlabels = []
+        for points in label:   # 每次更新一个框(人)
+            # point_labels = np.ones(len(points[0]))
+            mask, _, _ = mask_generate.predict(box=points[1][:-1],
+                                               # point_coords=points[0],
+                                               # point_labels=point_labels,
                                                multimask_output=False)   # 返回所有的分割对象
             cv_mask = (mask[0] ^ False).astype(np.uint8)
             retval, _, stats, _ = cv2.connectedComponentsWithStats(cv_mask, 8)
@@ -166,11 +194,23 @@ if __name__ == '__main__':
                 xmax = x2 if x2 > xmax else xmax
                 ymin = y1 if y1 < ymin else ymin
                 ymax = y2 if y2 > ymax else ymax
-            newlabel = [xmin, ymin, xmax, ymax]
-            newlabels.append(newlabel)
+            newlabel = [[int(xmin), int(ymin)], [int(xmax), int(ymax)]]
+            # newlabels.append(newlabel)
+            # 写json文件
+            shape = {}
+            shape['label'] = points[1][-1]
+            shape['points'] = newlabel
+            shape['group_id'] = 'None'
+            shape['shape_type'] = 'rectangle'
+            shape['flags'] = {}
+            datas['shapes'].append(shape)
 
-        for nlabel in newlabels:
-            cv2.rectangle(image, (nlabel[0], nlabel[1]), (nlabel[2], nlabel[3]), (255, 0, 0), 2)
-        filename = str(i).zfill(6) + '.jpg'
-        image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
-        cv2.imwrite(os.path.join(result_dir, filename), image)
+        with open(file_path, 'w') as f:
+            json.dump(datas, f)
+
+
+        # for nlabel in newlabels:
+        #     cv2.rectangle(image, (nlabel[0], nlabel[1]), (nlabel[2], nlabel[3]), (255, 0, 0), 2)
+        # filename = str(i).zfill(6) + '.jpg'
+        # image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+        # cv2.imwrite(os.path.join(result_dir, filename), image)
